@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller
+build/
+dist/
+
+# local Claude Code settings
+.claude/
+
+# personal data: the app recreates it on first start (examples included)
+data/*
+!data/fonts/
+
+# personal files, not part of the project
+*.lnk
+*.png
+!assets/*.png
+*.amc
