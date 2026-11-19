@@ -306,6 +306,7 @@ def test_run(on_press, on_release, delay_before=3.0):
     press_ops, release_ops = parse(on_press), parse(on_release)
 
     def worker():
+        winapi.boost_current_thread()
         time.sleep(delay_before)
         runner = Runner()
         runner.run(press_ops)

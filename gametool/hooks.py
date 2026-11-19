@@ -28,6 +28,7 @@ _POLL_MOUSE = {0x01: "MouseLeft", 0x02: "MouseRight", 0x04: "MouseMiddle",
                0x05: "MouseX1", 0x06: "MouseX2"}
 _POLL_SKIP = {0x10, 0x11, 0x12, 0xE7}
 _POLL_VKS = tuple(vk for vk in range(1, 256) if vk not in _POLL_SKIP)
+_ALL_POLL_VKS = frozenset(_POLL_VKS)
 # read on every cycle together with the triggers: mouse buttons and L/R/Win modifiers
 _POLL_HOT_BASE = frozenset(_POLL_MOUSE) | {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C}
 POLL_INTERVAL = 0.005
@@ -64,6 +65,7 @@ class InputHook:
         # VKs of the keys held down by the user that reached the applications
         # (excluding the ones we generated and the blocked ones)
         self.user_keys = set()
+        self._stale_candidates = set()
         self._thread = None
         self._thread_id = None
         self._ready = threading.Event()
@@ -228,6 +230,27 @@ class InputHook:
         finally:
             self._mode_lock.release()
 
+    def prune_user_keys(self):
+        """Forgets keys marked as held by the user that are actually up.
+
+        With hooks a release can be lost (e.g. Windows skipped a slow hook or
+        the hooks were reinstalled): the key would stay "held" forever and
+        macros would skip their KeyUp for it. Called about once a second; a
+        key is dropped only if it was up at two checks in a row, because the
+        hook sees a press slightly before Windows updates the key state.
+        Returns the dropped VKs.
+        """
+        if self._stealth:  # polling already keeps the set in sync on every cycle
+            self._stale_candidates = set()
+            return set()
+        get_state = winapi.user32.GetAsyncKeyState
+        up = {vk for vk in list(self.user_keys) if not get_state(vk) & 0x8000}
+        drop = up & self._stale_candidates
+        self._stale_candidates = up - drop
+        if drop:
+            self.user_keys.difference_update(drop)
+        return drop
+
     def _poll_loop(self, stop, keys_down):
         """In stealth mode, reads input at regular intervals without hooks.
 
@@ -236,12 +259,20 @@ class InputHook:
         be blocked. State changes caused by our macros are recognized with
         winapi.sent_by_us and marked as `ours`.
         """
+        winapi.boost_current_thread()
         get_state = winapi.user32.GetAsyncKeyState
         hot = _POLL_HOT_BASE
         last_pos = None
         tick = 0
+        # when each key was last read (start of that cycle): a state change is ours
+        # only if we sent it after that reading
+        now = time.perf_counter()
+        prev_full = prev_cycle = now
+        prev_scan = frozenset()
         while not stop.is_set():
-            if self.exclusive is not None or tick % FULL_SCAN_EVERY == 0:
+            now = time.perf_counter()
+            full = self.exclusive is not None or tick % FULL_SCAN_EVERY == 0
+            if full:
                 scan = _POLL_VKS
                 try:
                     hot = _POLL_HOT_BASE.union(self.hot_vks())
@@ -254,10 +285,22 @@ class InputHook:
             now_down = {vk for vk in scan if get_state(vk) & 0x8000}
             if now_down != keys_down:
                 for vk in now_down - keys_down:
-                    self._stealth_event("down", vk)
+                    since = prev_cycle if vk in prev_scan else prev_full
+                    self._stealth_event("down", vk, since)
                 for vk in keys_down - now_down:
-                    self._stealth_event("up", vk)
+                    # pressed keys are read on every cycle
+                    self._stealth_event("up", vk, prev_cycle)
                 keys_down = now_down
+            # a key that is up can't be held by the user: drops any key whose release
+            # was missed (it would make macros skip their KeyUp for it)
+            stale = [vk for vk in self.user_keys if vk not in keys_down]
+            if stale:
+                self.user_keys.difference_update(stale)
+            if full:
+                prev_full, prev_scan = now, _ALL_POLL_VKS
+            else:
+                prev_scan = scan
+            prev_cycle = now
             # --- position (for listeners that use want_moves) ---
             if self.want_moves:
                 pos = winapi.stealth_mouse_pos()
@@ -267,9 +310,9 @@ class InputHook:
                                               time=time.perf_counter()))
             stop.wait(POLL_INTERVAL)
 
-    def _stealth_event(self, kind, vk):
+    def _stealth_event(self, kind, vk, since=None):
         down = kind == "down"
-        ours = winapi.sent_by_us(vk, down)
+        ours = winapi.sent_by_us(vk, down, since=since)
         mouse = _POLL_MOUSE.get(vk)
         ev = InputEvent(kind=kind, name=mouse or keys.name_from_vk(vk),
                         vk=0 if mouse else vk, ours=ours, injected=ours,
@@ -284,6 +327,8 @@ class InputHook:
         self._dispatch(ev)
 
     def _loop(self, ready):
+        # a slow hook callback delays every key press and can get the hook removed
+        winapi.boost_current_thread()
         self._thread_id = winapi.kernel32.GetCurrentThreadId()
         hmod = winapi.kernel32.GetModuleHandleW(None)
         hooks = []

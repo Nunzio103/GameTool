@@ -34,6 +34,7 @@ class _Task(threading.Thread):
         self.stop()
 
     def run(self):
+        winapi.boost_current_thread()  # Delays stay accurate even while the game loads the CPU
         b = self.binding
         try:
             if b.mode == "once":
@@ -55,9 +56,12 @@ class _Task(threading.Thread):
                 # loop interrupted halfway: release whatever is still pressed
                 self.runner.release_all()
 
-            self.released.wait()
-            if not self.killed.is_set() and self.release_ops:
-                self.runner.run(self.release_ops, self.killed)
+            # wait for the release only if there is something to run then: if the
+            # release got lost, the macro would stay "running" and ignore every press
+            if self.release_ops:
+                self.released.wait()
+                if not self.killed.is_set():
+                    self.runner.run(self.release_ops, self.killed)
         finally:
             self.runner.release_all()
             self.engine._task_done(self)

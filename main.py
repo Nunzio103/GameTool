@@ -48,6 +48,7 @@ def main():
         return
     winapi.enable_dpi_awareness()
     winapi.enable_high_res_timer()
+    winapi.boost_process()
     root = tk.Tk()
     try:
         App(root)

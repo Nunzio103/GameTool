@@ -203,11 +203,20 @@ def _mark_sent(vk, down):
         _sent[_GENERIC_TO_LEFT[vk]] = entry
 
 
-def sent_by_us(vk, down, window=0.25):
+def sent_by_us(vk, down, window=0.25, since=None):
     """True if the last input we sent for vk put the key in the `down` state
-    less than `window` seconds ago."""
+    less than `window` seconds ago (and after `since`, if given).
+
+    `since` is when the key was last seen in the other state: a change we sent
+    before then can't be the one just observed. Without it a key the user taps
+    right after a macro released it would look like ours on release.
+    """
     entry = _sent.get(vk)
-    return entry is not None and entry[0] == down and time.perf_counter() - entry[1] <= window
+    if entry is None or entry[0] != down:
+        return False
+    if since is not None and entry[1] < since:
+        return False
+    return time.perf_counter() - entry[1] <= window
 
 
 def send_vk(vk, down):
@@ -358,6 +367,56 @@ def process_name(pid):
 
 def enable_high_res_timer():
     winmm.timeBeginPeriod(1)
+
+
+# --- scheduling priority -------------------------------------------------------
+# At normal priority, when a game keeps the CPU busy, Windows can leave a macro
+# thread waiting for tens of milliseconds (measured: a 12 ms Delay became 60-100 ms).
+# Raising the priority brings it back to a few milliseconds. The macro threads spend
+# almost all their time waiting, so this doesn't take CPU away from the game.
+ABOVE_NORMAL_PRIORITY_CLASS = 0x8000
+THREAD_PRIORITY_HIGHEST = 2
+PROCESS_POWER_THROTTLING = 4  # PROCESS_INFORMATION_CLASS.ProcessPowerThrottling
+POWER_THROTTLING_EXECUTION_SPEED = 0x1
+POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+
+# 64-bit handles: without restype/argtypes the pseudo-handles (-1, -2) get truncated
+# and the calls fail silently
+kernel32.GetCurrentProcess.restype = wt.HANDLE
+kernel32.GetCurrentThread.restype = wt.HANDLE
+kernel32.SetPriorityClass.argtypes = [wt.HANDLE, wt.DWORD]
+kernel32.SetPriorityClass.restype = wt.BOOL
+kernel32.SetThreadPriority.argtypes = [wt.HANDLE, ctypes.c_int]
+kernel32.SetThreadPriority.restype = wt.BOOL
+
+
+class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+    _fields_ = [("Version", wt.ULONG), ("ControlMask", wt.ULONG), ("StateMask", wt.ULONG)]
+
+
+def boost_process():
+    """Raises the process priority and opts out of Windows power throttling (EcoQoS).
+
+    Power throttling can slow down a background process and ignore its timer
+    resolution request while the game is in the foreground. Returns True if the
+    priority was raised.
+    """
+    ok = bool(kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS))
+    try:
+        fn = kernel32.SetProcessInformation  # Windows 8+; the throttling class needs Windows 10 1709+
+        fn.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+        fn.restype = wt.BOOL
+        mask = POWER_THROTTLING_EXECUTION_SPEED | POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        state = PROCESS_POWER_THROTTLING_STATE(1, mask, 0)  # StateMask 0 = throttling off
+        fn(kernel32.GetCurrentProcess(), PROCESS_POWER_THROTTLING, ctypes.byref(state), ctypes.sizeof(state))
+    except (AttributeError, OSError):
+        pass
+    return ok
+
+
+def boost_current_thread():
+    """Gives the calling thread high priority (macro runners and input reading)."""
+    return bool(kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_HIGHEST))
 
 
 shell32 = ctypes.WinDLL("shell32")

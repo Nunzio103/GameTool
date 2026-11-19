@@ -611,9 +611,11 @@ class App:
     def _watchdog(self):
         """Checks every second that Windows hasn't removed the input hooks."""
         try:
-            if not self._incognito_busy and self.hook.check_alive():
-                self.engine.reset_input_state()
-                self.set_status("⚠  Windows had turned off key input: restored", error=True)
+            if not self._incognito_busy:
+                if self.hook.check_alive():
+                    self.engine.reset_input_state()
+                    self.set_status("⚠  Windows had turned off key input: restored", error=True)
+                self.hook.prune_user_keys()
         except Exception:
             traceback.print_exc()
         self.root.after(1000, self._watchdog)
